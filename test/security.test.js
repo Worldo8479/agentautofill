@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { request as httpRequest } from 'node:http';
 import { createApp } from '../server/app.js';
+import { Vault } from '../server/vault.js';
 
 const password = 'test-only-master-password-2026';
 async function fixture(t, options = {}) {
@@ -14,35 +15,39 @@ async function fixture(t, options = {}) {
   const app = createApp({ dataPath: join(dir, 'vault.enc'), runner, ...options });
   await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${app.server.address().port}`;
-  let token;
+  let cookie;
+  let csrf;
   async function request(path, body, { owner = true, method, headers = {} } = {}) {
-    const response = await fetch(`${origin}${path}`, { method: method || (body === undefined ? 'GET' : 'POST'), headers: { Origin: origin, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), ...(owner && token ? { Authorization: `Bearer ${token}` } : {}), ...headers }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
-    return { status: response.status, body: await response.json(), headers: response.headers };
+    const response = await fetch(`${origin}${path}`, { method: method || (body === undefined ? 'GET' : 'POST'), headers: { Origin: origin, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), ...(owner && cookie ? { Cookie: cookie, 'X-CSRF-Token': csrf } : {}), ...headers }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+    const result = { status: response.status, body: await response.json(), headers: response.headers };
+    if (owner && response.headers.has('set-cookie')) cookie = response.headers.get('set-cookie').split(';')[0];
+    if (owner && result.body.csrf) csrf = result.body.csrf;
+    return result;
   }
-  const setup = await request('/api/setup', { password });
-  assert.equal(setup.status, 200); token = setup.body.token;
+  const setup = await request('/api/auth/signup', { name: 'Test Owner', email: 'owner@example.com', password });
+  assert.equal(setup.status, 201);
   await request('/api/entries', { type: 'identity', label: 'Personal identity', values: { firstName: 'NeverReturnThisSecret', email: 'secret-value@example.com' } });
   const entry = (await request('/api/vault')).body.entries[0];
   async function grant(overrides = {}) {
     return request('/api/passes', { entryId: entry.id, minutes: 15, mappings: [{ field: 'firstName', selector: '#firstName' }], ...overrides });
   }
   t.after(async () => { await app.close(); await rm(dir, { recursive: true, force: true }); });
-  return { app, request, grant, entry, origin, dir, fills: () => fills, setToken: next => { token = next; } };
+  return { app, request, grant, entry, origin, dir, fills: () => fills, credentials: () => ({ cookie, csrf }), signup: setup };
 }
 
-test('encrypted persistence, metadata-only reads, and password protection survive restart', async t => {
+test('encrypted storage, metadata-only reads, and password protection survive logout', async t => {
   const f = await fixture(t);
-  const disk = await readFile(join(f.dir, 'vault.enc'), 'utf8');
+  const disk = await readFile(join(f.dir, 'accounts.enc'), 'utf8');
   assert.ok(!disk.includes('NeverReturnThisSecret'));
   assert.ok(!disk.includes('secret-value@example.com'));
   assert.ok(!disk.includes(password));
   assert.deepEqual(f.entry.fields, ['firstName', 'email']);
   assert.equal(f.entry.values, undefined);
   assert.equal((await f.request('/api/vault', undefined, { owner: false })).status, 401);
-  await f.request('/api/lock', {});
-  assert.equal((await f.request('/api/unlock', { password: 'incorrect-but-long-password' })).status, 400);
-  const unlock = await f.request('/api/unlock', { password });
-  f.setToken(unlock.body.token);
+  await f.request('/api/auth/logout', {});
+  assert.equal((await f.request('/api/auth/login', { email: 'owner@example.com', password: 'incorrect-but-long-password' })).status, 401);
+  const login = await f.request('/api/auth/login', { email: 'owner@example.com', password });
+  assert.equal(login.status, 200);
   assert.equal((await f.request('/api/vault')).body.entries.length, 1);
 });
 
@@ -134,8 +139,8 @@ test('expiry supports up to 30 days, survives daily cleanup, and expires at the 
   assert.equal(usable.expiresAt, createdAt + 30 * 24 * 60 * 60000);
   assert.ok(usable.prompt.includes(new Date(usable.expiresAt).toISOString()));
   now += 29 * 24 * 60 * 60000;
-  // Keep owner activity current to isolate retention from the separate inactivity lock.
-  await f.request('/api/vault');
+  // Sessions expire separately from keys: log back in after advancing 29 days.
+  await f.request('/api/auth/login', { email: 'owner@example.com', password });
   t.mock.timers.tick(30000);
   const passes = (await f.request('/api/vault')).body.passes;
   assert.equal(passes.find(pass => pass.id === usable.id)?.status, 'ready');
@@ -145,15 +150,15 @@ test('expiry supports up to 30 days, survives daily cleanup, and expires at the 
   assert.equal(f.fills(), 1);
 });
 
-test('locking or editing revokes unused grants, and invalid scopes cannot be created', async t => {
+test('editing revokes unused grants while account logout preserves authorized keys', async t => {
   const f = await fixture(t);
   assert.equal((await f.grant({ mappings: [{ field: 'password', selector: '#firstName' }] })).status, 400);
   const pass = (await f.grant()).body;
   await f.request('/api/entries', { id: f.entry.id, type: 'identity', label: 'Updated', values: { firstName: 'Replacement' } });
   assert.equal((await f.request(`/api/agent/${pass.id}/execute`, { pin: pass.pin, target: `${f.origin}/demo` }, { owner: false })).status, 410);
   const next = (await f.grant()).body;
-  await f.request('/api/lock', {});
-  assert.equal((await f.request(`/api/agent/${next.id}/execute`, { pin: next.pin }, { owner: false })).status, 410);
+  await f.request('/api/auth/logout', {});
+  assert.equal((await f.request(`/api/agent/${next.id}/execute`, { pin: next.pin, target: `${f.origin}/demo` }, { owner: false })).status, 200);
 });
 
 test('failed browser fills consume the PIN and never return underlying errors', async t => {
@@ -175,6 +180,122 @@ test('host, origin, owner authorization, and input boundaries reject unauthorize
   assert.equal(hostStatus, 403);
   assert.equal((await f.request('/api/entries', { type: 'identity' }, { owner: false })).status, 401);
   assert.equal((await f.request('/api/entries', { type: 'not-a-type', label: 'x', values: {} })).status, 400);
-  assert.equal((await f.request('/api/setup', { password })).status, 400);
+  assert.equal((await f.request('/api/auth/signup', { name: 'Duplicate', email: 'OWNER@example.com', password })).status, 409);
   assert.equal((await f.request('/api/entries', { type: 'identity', label: 'x'.repeat(70000), values: {} })).status, 413);
+});
+
+test('signup issues a cookie session, refresh restores it, and logout invalidates the old cookie', async t => {
+  const f = await fixture(t);
+  const cookie = f.signup.headers.get('set-cookie');
+  assert.match(cookie, /HttpOnly/);
+  assert.match(cookie, /SameSite=Strict/);
+  assert.match(cookie, /Path=\/api/);
+  assert.equal(f.signup.body.token, undefined);
+  const session = await f.request('/api/auth/session');
+  assert.equal(session.body.user.email, 'owner@example.com');
+  assert.equal(session.body.csrf, f.credentials().csrf);
+  assert.equal(session.body.user.passwordHash, undefined);
+  const old = f.credentials();
+  assert.equal((await f.request('/api/auth/logout', {})).status, 200);
+  assert.equal((await f.request('/api/auth/session')).body.user, null);
+  assert.equal((await f.request('/api/vault', undefined, { headers: { Cookie: old.cookie } })).status, 401);
+  assert.equal((await f.request('/api/auth/login', { email: 'OWNER@EXAMPLE.COM', password })).status, 200);
+  assert.notEqual(f.credentials().cookie, old.cookie);
+  assert.equal((await f.request('/api/vault')).body.entries.length, 1);
+});
+
+test('account isolation prevents reading, editing, deleting, or revoking another account’s data', async t => {
+  const f = await fixture(t);
+  const firstPass = (await f.grant()).body;
+  const first = f.credentials();
+  const signup = await f.request('/api/auth/signup', { name: 'Second User', email: 'second@example.com', password: 'another-account-password' });
+  assert.equal(signup.status, 201);
+  const isolated = (await f.request('/api/vault')).body;
+  assert.deepEqual(isolated.entries, []);
+  assert.deepEqual(isolated.passes, []);
+  assert.ok(!JSON.stringify(isolated).includes('Personal identity'));
+  assert.equal((await f.request('/api/entries', { id: f.entry.id, type: 'identity', label: 'Stolen', values: { firstName: 'x' } })).status, 404);
+  assert.equal((await f.request(`/api/entries/${f.entry.id}`, {}, { method: 'DELETE' })).status, 404);
+  assert.equal((await f.grant()).status, 400);
+  assert.equal((await f.request(`/api/passes/${firstPass.id}/revoke`, {})).status, 409);
+  // Signup rotates only this browser session; signing into the original account restores its records.
+  assert.equal((await f.request('/api/vault', undefined, { headers: { Cookie: first.cookie } })).status, 401);
+  await f.request('/api/auth/login', { email: 'owner@example.com', password });
+  assert.equal((await f.request('/api/vault')).body.entries[0].label, 'Personal identity');
+});
+
+test('CSRF, malformed credentials, duplicate signup, login throttling and session expiry are enforced', async t => {
+  let now = Date.now();
+  const f = await fixture(t, { now: () => now });
+  assert.equal((await f.request('/api/entries', { type: 'identity', label: 'CSRF', values: { firstName: 'x' } }, { headers: { 'X-CSRF-Token': '' } })).status, 403);
+  assert.equal((await f.request('/api/auth/logout', {}, { headers: { Origin: 'https://evil.example' } })).status, 403);
+  assert.equal((await f.request('/api/auth/signup', { name: 'Bad', email: 'invalid', password })).status, 400);
+  assert.equal((await f.request('/api/auth/signup', { name: 'Bad', email: 'bad@example.com', password: 'short' })).status, 400);
+  const unknown = await f.request('/api/auth/login', { email: 'missing@example.com', password });
+  const wrong = await f.request('/api/auth/login', { email: 'owner@example.com', password: 'wrong-but-long-enough' });
+  assert.equal(unknown.status, 401);
+  assert.deepEqual(unknown.body, wrong.body);
+  for (let i = 0; i < 7; i++) await f.request('/api/auth/login', { email: 'missing@example.com', password });
+  assert.equal((await f.request('/api/auth/login', { email: 'missing@example.com', password })).status, 429);
+  now += 7 * 24 * 60 * 60000;
+  assert.equal((await f.request('/api/auth/session')).body.user, null);
+  assert.equal((await f.request('/api/vault')).status, 401);
+});
+
+test('legacy import requires its old password, preserves the original, and can be claimed only once', async t => {
+  const f = await fixture(t);
+  const legacyPath = join(f.dir, 'vault.enc');
+  const legacy = new Vault(legacyPath);
+  legacy.unlock('old-vault-password-only', true);
+  legacy.data.entries.push({ id: 'legacy-id', label: 'Legacy item', type: 'identity', site: '', values: { firstName: 'LegacySecret' }, updatedAt: new Date().toISOString() });
+  legacy.save(); legacy.lock();
+  const before = await readFile(legacyPath);
+  assert.equal((await f.request('/api/auth/session')).body.legacyAvailable, true);
+  assert.equal((await f.request('/api/account/import-legacy', { password: 'wrong-old-password' })).status, 400);
+  assert.equal((await f.request('/api/vault')).body.entries.length, 1);
+  const imported = await f.request('/api/account/import-legacy', { password: 'old-vault-password-only' });
+  assert.equal(imported.status, 200);
+  assert.equal(imported.body.imported, 1);
+  const entries = (await f.request('/api/vault')).body.entries;
+  assert.equal(entries.length, 2);
+  assert.equal(entries[1].label, 'Legacy item');
+  assert.notEqual(entries[1].id, 'legacy-id');
+  assert.deepEqual(await readFile(legacyPath), before);
+  assert.equal((await f.request('/api/account/import-legacy', { password: 'old-vault-password-only' })).status, 409);
+  await f.request('/api/auth/signup', { name: 'Other', email: 'other@example.com', password });
+  assert.equal((await f.request('/api/account/import-legacy', { password: 'old-vault-password-only' })).status, 409);
+});
+
+test('accounts and one-use keys survive server restart without exposing passwords or plaintext data', async t => {
+  const f = await fixture(t);
+  const pass = (await f.grant({ minutes: 43200 })).body;
+  const oldCookie = f.credentials().cookie;
+  const disk = await readFile(join(f.dir, 'accounts.enc'), 'utf8');
+  assert.ok(!disk.includes(password));
+  assert.ok(!disk.includes('owner@example.com'));
+  assert.ok(!disk.includes(pass.pin));
+  assert.ok(!disk.includes('NeverReturnThisSecret'));
+  await f.app.close();
+  let fills = 0;
+  const restarted = createApp({ dataPath: join(f.dir, 'vault.enc'), runner: { async fill({ mappings }) { fills++; return { filled: mappings.length }; }, async closeAll() {} } });
+  await new Promise(resolve => restarted.server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${restarted.server.address().port}`;
+  try {
+    const oldSession = await fetch(`${origin}/api/auth/session`, { headers: { Cookie: oldCookie } });
+    assert.equal((await oldSession.json()).user, null);
+    const response = await fetch(`${origin}/api/agent/${pass.id}/execute`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pin: pass.pin, target: `${origin}/demo` }) });
+    assert.equal(response.status, 200);
+    assert.equal(fills, 1);
+    const login = await fetch(`${origin}/api/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: origin }, body: JSON.stringify({ email: 'owner@example.com', password }) });
+    assert.equal(login.status, 200);
+    const cookie = login.headers.get('set-cookie').split(';')[0];
+    const metadata = await fetch(`${origin}/api/vault`, { headers: { Cookie: cookie } });
+    assert.equal((await metadata.json()).passes[0].status, 'used');
+  } finally { await restarted.close(); }
+  const third = createApp({ dataPath: join(f.dir, 'vault.enc'), runner: { async fill() { throw new Error('Must not replay'); }, async closeAll() {} } });
+  await new Promise(resolve => third.server.listen(0, '127.0.0.1', resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${third.server.address().port}/api/agent/${pass.id}/execute`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pin: pass.pin, target: `${origin}/demo` }) });
+    assert.equal(response.status, 410);
+  } finally { await third.close(); }
 });

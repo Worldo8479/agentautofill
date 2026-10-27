@@ -1,10 +1,10 @@
 # agentautofill
 
-A local web app for saving logins, identities, and addresses, then granting an AI agent a **single autofill action with approved fields** without returning the saved values through the agent API.
+A local web app with signup, login, account-specific autofill records, and single-use agent keys. An agent can trigger a private form fill without receiving saved values through the API.
 
 ## Run
 
-Requires Node.js 22 or newer and a graphical desktop for the private browser window.
+Requires Node.js 22+ and a graphical desktop for private browser windows.
 
 ```sh
 npm install
@@ -12,70 +12,42 @@ npm run browser:install
 npm start
 ```
 
-Open **http://127.0.0.1:4317**. On macOS, an existing Google Chrome installation is used automatically, so the browser installation step is optional. On other platforms, install Chromium with the command above, or set `BROWSER_CHANNEL=chrome` to use installed Google Chrome.
-
-Optional environment variables:
+Open **http://127.0.0.1:4317**. Existing Google Chrome is used automatically on macOS, making the browser-install step optional there. Elsewhere, install Chromium or set `BROWSER_CHANNEL=chrome` to use installed Chrome.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `PORT` | `4317` | Loopback HTTP port |
-| `VAULT_PATH` | `.data/vault.enc` | Encrypted vault location |
+| `VAULT_PATH` | `.data/vault.enc` | Previous vault to import; its parent directory holds new account storage |
 | `BROWSER_CHANNEL` | Chrome on macOS when available; bundled Chromium otherwise | Playwright browser channel |
 
-No external API keys, model subscriptions, remote databases, or build step are required. The prompt is generated locally from the approved grant; no AI service receives your vault data.
+No external API keys, model subscriptions, email provider, or build step are required. Prompts are generated locally; no AI service receives your saved details.
 
-## Use it
+## Accounts
 
-1. Create a master password of at least 12 characters. There is no recovery mechanism.
-2. Add a login, identity, or address. Existing values are never revealed in the UI; editing replaces only the fields you enter. To remove a field, delete and recreate the item.
-3. Create an agent pass. Choose an item, expiration (5 minutes to 30 days), allowed fields, and form selectors. **No destination URL is required or stored on a key.** Login items remain restricted to their saved HTTPS origin when used.
-4. Copy the generated prompt. It contains a unique `/agent/<random-id>` branch, a 32-digit one-time PIN, the field scope, selectors, and expiry. The PIN is only shown at creation.
-5. The agent opens that branch and enters the PIN and the page URL for its task, or supplies `pin` and `target` to the JSON endpoint in the prompt. A separate browser window fills the fields. The agent response contains only success/failure and the number of filled fields.
-6. **You** review the private window and submit manually. agentautofill does not automatically submit forms. Windows close after 15 minutes or when you lock the vault.
+1. Choose **Sign up**, enter your name and email, and choose a password of at least 12 characters.
+2. Use **Log in** with that email and password. Email matching is case-insensitive. Each account has separate saved items, keys, and activity.
+3. Refreshing the page preserves login through an HttpOnly cookie. Sessions expire seven days after login. **Log out** invalidates the current browser session; other signed-in browsers remain signed in.
+4. After a server restart, log in again. Account records, saved details, and unexpired keys persist.
 
-For a first test, create your vault, click **Try a sample identity**, create a pass for that item without a destination, then open its agent page and choose **Use the local demo form** when redeeming it. The demo never sends entered values anywhere. Its selectors are preconfigured.
+These are accounts for this local installation, not cloud accounts. Email is a login identifier: email verification, password reset, and account recovery are not implemented. Keep your password safe.
 
-The owner UI provides search, category filters, editing, deletion, pass revocation, and an encrypted activity history. Locking revokes all pending passes and closes private windows. Updating or deleting an item revokes its pending passes.
+### Import your previous vault
 
-## How the privacy boundary works
+The previous `.data/vault.enc` file is preserved. After creating an account, use **Import vault** and enter its previous master password. Items are copied into the signed-in account, and the original encrypted file is left byte-for-byte unchanged. Only one account can claim that import; knowing a new account password alone does not grant access to the old vault. No old password or item values are returned to the browser during import.
 
-```text
-Owner UI ── master password ──> Local encrypted vault
-    │                                  │
-    └── approved fields + expiry ──> One-use grant
-                                       │
-Agent ── branch + PIN + page URL ──> Redeem ──> Private browser ──> Chosen website
-    <── status + count only ──┘              │
-                                       Owner reviews
-```
+Do not delete the original until you have verified your imported items and made a backup. Old in-memory passes from the pre-account app cannot be recovered; create new keys after importing.
 
-The PIN is a capability to perform one action; it is **not** an encryption key or a promise that arbitrary agent tools cannot inspect your computer. Prompts alone cannot hide a value from an agent that can read the DOM of the browser receiving it. agentautofill therefore never offers the agent browser handles, DOM reads, screenshots, cookies, arbitrary navigation, or scripts.
+## Create and use an agent key
 
-### Included protections
+1. Add a login, identity, or address. Existing values remain hidden; editing replaces only fields you enter. Delete and recreate an item to remove a field.
+2. Create an agent pass. Choose the item, allowed fields, CSS selectors, and an expiry from **5 minutes to 30 days**. No destination URL is required or stored on a key.
+3. Copy the generated prompt. It contains a unique `/agent/<random-id>` branch, a random 32-digit one-time PIN, scope, selectors, and expiry. The PIN is shown once.
+4. The agent opens that branch and enters the PIN and the page URL for its task, or sends the JSON request below. Only public HTTPS pages and the local demo are supported. Login items remain restricted to their saved website origin.
+5. A fresh, separate browser window fills the selected fields. The agent receives only status and a field count. **You** review and submit manually. Windows close after 15 minutes or when the server stops.
 
-- AES-256-GCM encrypted storage with a fresh IV on every write; scrypt key derivation with a random salt (`N=32768`, `r=8`, `p=1`). Atomic file replacement and restrictive file permissions.
-- Master password and encryption key are not persisted. The owner’s bearer token stays only in page memory, not cookies or local storage. No plaintext-value retrieval endpoint exists.
-- Cryptographically random 128-bit branch IDs and 32-digit PINs (approximately 106 bits). Only PIN hashes are held by the server.
-- Keys are reserved while the agent-supplied URL is validated, then the PIN is atomically consumed before launching a browser. Missing, invalid, or disallowed URLs leave the key available for a corrected request. A failed or interrupted fill still consumes the PIN. Five wrong PIN attempts revoke a grant.
-- Expiry, explicit revocation, a 30-minute owner-API inactivity lock, and a limit on private browser windows. Keys may expire up to 30 days after creation and are retained until their expiry, plus one day of history. Locking (including the inactivity lock) still revokes pending keys; all passes are ephemeral and invalid after a process restart. A long expiration does not keep the vault unlocked.
-- No target URL is stored or required at key creation. The agent supplies it at redemption. Exact URL checks during each fill and login origin binding still apply. Public HTTPS destinations only, apart from the built-in loopback demo. Public target DNS is validated and its address is pinned in the private browser to reduce rebinding risk.
-- Private contexts without service workers or downloads. Cross-origin requests, popups, WebSockets, and navigation away from the exact URL are blocked. Errors from browser internals are replaced with fixed messages, because raw browser errors can contain sensitive values.
-- Loopback-only binding, Host and Origin validation, JSON-only mutation endpoints, no CORS, strict CSP, no-store responses, and no third-party scripts, analytics, fonts, or remote assets in the owner UI.
+Keys remain usable after logout and server restarts, until used, revoked, or expired. Logging out is not a substitute for revoking a key. Updating or deleting an item revokes its unused keys. A failed browser fill still consumes the PIN; missing or disallowed page URLs may be corrected without consuming it.
 
-### Important limits
-
-- **An agent with unrestricted shell, filesystem, debugger, desktop/screen, process-memory, or private-browser access is outside this boundary.** Do not give such an agent access to your unlocked owner session. JavaScript strings and browser memory cannot be reliably zeroed; the OS and browser may retain memory or crash dumps. Key buffers are cleared on lock, but this is not an OS-level secret-isolation product.
-- The destination website necessarily receives the values. A trusted origin can still contain malicious or compromised scripts and can transmit the values. Share keys only with agents you trust to choose the right destination. A key for identity or address data lets its holder choose any supported public HTTPS page. These controls do not make a malicious destination safe.
-- The browser is a fresh isolated session, not the user’s or agent’s existing authenticated browser. Third-party authentication, redirects, embedded frames, CAPTCHAs, payment workflows, and sites requiring external assets may not work. A page changing during filling can cause a partial fill; the pass is consumed and its window closes on failure. Manually submitting to a different URL is also blocked by the exact-page policy.
-- **Localhost works for an agent operating on the same machine.** A cloud agent cannot reach another machine’s loopback interface. Use an authorized local request tool. Do not tunnel or publish the owner app: it has no production multi-user authentication, HTTPS termination, distributed storage, or remotely hosted browser isolation. A remote relay would need a separately secured, agent-only gateway.
-- Labels, the agent-branch URL, field names, selectors, and the PIN appear in the generated prompt. No destination URL is preset. Keep secrets out of labels and out of any page URL supplied at redemption. The agent can see this scope metadata, and the recipient of the prompt can consume the capability.
-- This is a working local prototype, **not an independently audited password manager**. Do not use it as the only backup of important credentials.
-
-Back up `.data/vault.enc` while the app is stopped. Restore that file and use the original master password. Pending passes are intentionally not backed up. The vault file and dependencies are git-ignored; never commit vault files or pass prompts.
-
-## Agent endpoint
-
-The generated prompt supplies the full URL and PIN. A successful call returns no secret values:
+For a first test, add the sample identity, create a key, open its agent page, and choose **Use the local demo form**. That form never sends entered values to a server.
 
 ```http
 POST /api/agent/<branch-id>/execute
@@ -84,26 +56,52 @@ Content-Type: application/json
 {"pin":"<one-time PIN>","target":"https://example.com/form"}
 ```
 
-```json
-{
-  "status": "filled",
-  "fieldsFilled": 4,
-  "message": "Filled in the owner’s private browser. The owner must review and submit. No values are returned."
-}
-```
+A successful response contains `status: "filled"`, `fieldsFilled`, and a fixed explanatory message. It never contains autofill values. Invalid PINs return `401`; missing or disallowed URLs return `400`; unavailable or consumed keys return `410`; browser failures return `422` and consume the key.
 
-Agent calls require no owner token. Missing or disallowed page URLs return `400` without consuming the PIN. Invalid PINs return `401`; unavailable, expired, or consumed passes return `410`; browser failures return `422` and consume the pass. Unknown requests never return raw vault values or underlying browser diagnostics.
+## Storage and security boundary
 
-## Development and checks
+Account data is encrypted using AES-256-GCM, with a fresh IV for every atomic write. The encryption key is managed by the local server, not derived from each user's account password. This lets authorized agent keys work while the owner is logged out. Account passwords use independent random salts and scrypt verifiers (`N=32768`, `r=8`, `p=1`). Passwords are never stored in plaintext.
+
+Back up **both** files while the server is stopped:
+
+- `.data/accounts.enc` — encrypted account metadata, password verifiers, saved details, activity, key hashes, and key states.
+- `.data/account-key` — the random installation encryption key, created with owner-only file permissions.
+
+Losing `account-key` makes the account database unreadable. Anyone with access to both files can decrypt it, so protect the device and the backup. The server refuses to generate a replacement key over an existing database. `.data/` is git-ignored.
+
+The app enforces:
+
+- Account ownership on every owner API operation; no plaintext-value retrieval endpoint.
+- Random session identifiers stored as hashes on the server. Cookies are HttpOnly and SameSite=Strict, with a seven-day server-enforced expiry. Sessions are not persisted across server restarts. Cookie names include the port to isolate separate local installations.
+- Same-origin checks, JSON-only mutation requests, and session-bound CSRF tokens for authenticated writes. Signup/login rate limits and generic incorrect-credential responses.
+- Random 128-bit agent branch IDs and 32-digit PINs (about 106 bits of entropy). Only PIN hashes are persisted. Five incorrect attempts revoke a key.
+- A reservation during destination validation, and persisted consumption before any browser work. Interrupted in-flight keys fail closed on restart instead of becoming replayable.
+- Public destination DNS validation and address pinning. Login origin checks and exact-page checks during filling.
+- Private contexts without downloads or service workers. Cross-origin requests, popups, WebSockets, and navigation away from the supplied URL are blocked. Raw browser errors are never returned to agents.
+- Loopback-only HTTP binding, Host validation, no CORS, strict CSP, and no-store responses. The owner UI uses no third-party scripts, analytics, fonts, or assets.
+
+### Limits
+
+The local HTTP cookie does not use the `Secure` flag because the app serves loopback HTTP. Public deployment would require HTTPS, secure cookies, operational hardening, and a separately secured browser service; do not tunnel this owner app to the internet.
+
+The destination website receives the filled values and can read or transmit them. Share keys only with agents you trust to choose the intended destination. An identity or address key allows its holder to choose any supported public HTTPS page.
+
+An agent with unrestricted shell, filesystem, debugger, desktop/screen, process-memory, owner-session, or private-browser access is outside the privacy boundary. Prompts cannot enforce secrecy against those tools. The service decrypts data in memory and cannot reliably erase JavaScript strings or browser memory.
+
+The private browser is a fresh session, not the owner's or agent's existing authenticated browser. Third-party authentication, redirects, embedded frames, CAPTCHAs, payment flows, and websites requiring cross-origin resources may not work. A changing page may cause a partial fill; failure consumes the key and closes its window. Submitting to a different URL is also blocked.
+
+A cloud agent cannot reach another computer's localhost. Use an authorized local request tool. The app remains a local prototype, not an independently audited password manager, and should not be your only credential backup.
+
+Relevant references: [OWASP session management](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html), [Node crypto](https://nodejs.org/api/crypto.html), and [Playwright isolated contexts](https://playwright.dev/docs/browser-contexts).
+
+## Development
 
 ```sh
-npm run dev       # watch the Node server; reload the browser after frontend edits
+npm run dev       # Watch the server; reload the browser for frontend changes
 npm run check     # JavaScript syntax checks
-npm test          # API security tests + a real headless private-browser fill
+npm test          # Authentication, isolation, migration, key lifecycle, and browser tests
 ```
 
-Tests use temporary encrypted vaults and fictional values; they never use `.data/vault.enc`. Browser integration tests require Chrome/Chromium. On a machine without Chrome, run `npm run browser:install` first.
+Tests use temporary accounts and fictional records; they never use the real `.data` directory. The browser integration test requires Chrome or Chromium.
 
-For disposable manual UI testing, `node test/preview-fixture.js` starts a fictional workspace on port 4318. Unlock it with `local-ui-test-only-password`. Its vault is held in the OS temporary directory and is removed on normal shutdown. Do not use it for real data.
-
-The implementation uses Node’s built-in HTTP and crypto libraries with Playwright as its only runtime dependency. Frontend files are served directly, so deployment to static hosting alone cannot provide the private autofill service. Relevant platform references: [Node crypto](https://nodejs.org/api/crypto.html), [Playwright isolated contexts](https://playwright.dev/docs/browser-contexts), and [Playwright request interception](https://playwright.dev/docs/api/class-browsercontext#browser-context-route).
+`node test/preview-fixture.js` creates a disposable workspace on port 4318. Log in with `alex@example.com` and `local-ui-test-only-password`. It contains fictional sample data and is removed on normal shutdown. Never save real data in that preview.

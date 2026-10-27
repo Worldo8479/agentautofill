@@ -17,5 +17,7 @@ for (const entry of [
 vault.audit('Demo workspace created', 'Fictional data for UI testing only');
 vault.lock();
 const app = createApp({ dataPath });
+const previewAccount = await app.store.signup({ name: 'Alex Morgan', email: 'alex@example.com', password: 'local-ui-test-only-password' });
+app.store.importLegacy(previewAccount, 'local-ui-test-only-password');
 app.server.listen(4318, '127.0.0.1', () => console.log('Disposable UI preview at http://127.0.0.1:4318'));
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, async () => { await app.close(); await rm(dir, { recursive: true, force: true }); process.exit(0); });

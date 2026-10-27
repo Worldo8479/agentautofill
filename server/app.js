@@ -1,9 +1,9 @@
 import { createServer } from 'node:http';
 import { randomBytes, randomInt, createHash, timingSafeEqual } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { resolve, dirname } from 'node:path';
 import { lookup } from 'node:dns/promises';
-import { Vault } from './vault.js';
+import { AccountStore } from './accounts.js';
 import { PrivateRunner } from './runner.js';
 
 const publicDir = resolve(import.meta.dirname, '../public');
@@ -34,29 +34,36 @@ async function validateTarget(raw, origin) {
   return { target: url.href, resolvedAddress: (answers.find(answer => answer.family === 4) || answers[0]).address };
 }
 
-export function createApp({ dataPath = resolve('.data/vault.enc'), runner = new PrivateRunner(), now = () => Date.now() } = {}) {
-  const vault = new Vault(dataPath);
-  const passes = new Map();
-  let session = null;
-  let lastActive = 0;
-  let unlockAttempts = [];
+export function createApp({ dataPath = resolve('.data/vault.enc'), runner, runnerFactory = () => new PrivateRunner(), now = () => Date.now() } = {}) {
+  const store = new AccountStore({ directory: dirname(dataPath), legacyPath: dataPath, now });
+  const passes = store.passes;
+  const runners = new Map();
+  const attempts = new Map();
   let closing = false;
+  const runnerFor = accountId => {
+    if (!runners.has(accountId)) runners.set(accountId, runner || runnerFactory());
+    return runners.get(accountId);
+  };
   const passState = pass => pass.status === 'ready' && pass.expiresAt <= now() ? 'expired' : pass.status;
   const passMetadata = pass => ({ id: pass.id, label: pass.label, entryId: pass.entryId, fields: pass.mappings.map(m => m.field), createdAt: pass.createdAt, expiresAt: pass.expiresAt, status: passState(pass) });
-  function revokeFor(entryId) { for (const pass of passes.values()) if (pass.entryId === entryId && ['ready', 'validating'].includes(pass.status)) pass.status = 'revoked'; }
-  async function lock() {
-    closing = true;
-    session = null;
-    for (const pass of passes.values()) if (['ready', 'validating'].includes(pass.status)) pass.status = 'revoked';
-    vault.lock();
-    try { await runner.closeAll(); } finally { closing = false; }
+  function revokeFor(accountId, entryId) { for (const pass of passes.values()) if (pass.accountId === accountId && pass.entryId === entryId && ['ready', 'validating'].includes(pass.status)) pass.status = 'revoked'; }
+  function rateLimit(key, limit) {
+    const recent = (attempts.get(key) || []).filter(at => now() - at < 60000);
+    requireThat(recent.length < limit, 'Too many attempts. Wait one minute.', 429);
+    recent.push(now()); attempts.set(key, recent);
   }
   const maintenance = setInterval(() => {
-    if (session && now() - lastActive > 30 * 60 * 1000) void lock();
-    // Retain long-lived keys until their expiry, plus a day for viewing their final status.
-    for (const [id, pass] of passes) if (now() - pass.expiresAt > 24 * 60 * 60 * 1000) passes.delete(id);
+    store.pruneSessions();
+    for (const [key, recent] of attempts) if (!recent.some(at => now() - at < 60000)) attempts.delete(key);
+    let changed = false;
+    for (const [id, pass] of passes) if (now() - pass.expiresAt > 24 * 60 * 60 * 1000) { passes.delete(id); changed = true; }
+    if (changed) store.save();
   }, 30000);
   maintenance.unref();
+  // Cookies have no port scope, so name them per installation port to isolate local previews.
+  const cookieName = () => `agentautofill_session_${server.address().port}`;
+  const sessionToken = req => (req.headers.cookie || '').split(';').map(part => part.trim()).find(part => part.startsWith(`${cookieName()}=`))?.slice(cookieName().length + 1);
+  const setCookie = (res, token) => res.setHeader('Set-Cookie', `${cookieName()}=${token || ''}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=${token ? 7 * 24 * 60 * 60 : 0}`);
 
   const server = createServer(async (req, res) => {
     const port = server.address().port;
@@ -91,65 +98,85 @@ export function createApp({ dataPath = resolve('.data/vault.enc'), runner = new 
           try { body = raw ? JSON.parse(raw) : {}; } catch { throw new HttpError(400, 'Invalid JSON.'); }
           requireThat(body && typeof body === 'object' && !Array.isArray(body), 'Invalid request.');
         }
-        if (path === '/api/status' && req.method === 'GET') return reply(200, { initialized: vault.exists });
-        if (['/api/setup', '/api/unlock'].includes(path) && req.method === 'POST') {
-          requireThat(req.headers.origin === origin, 'Open the owner app to unlock.', 403);
-          requireThat(!closing, 'Vault is locking. Try again shortly.', 409);
-          unlockAttempts = unlockAttempts.filter(at => now() - at < 60000);
-          requireThat(unlockAttempts.length < 5, 'Too many attempts. Wait one minute.', 429);
-          unlockAttempts.push(now());
-          try { vault.unlock(body.password, path === '/api/setup'); } catch (error) { throw new HttpError(400, error.message); }
-          session = randomBytes(32).toString('base64url'); lastActive = now();
-          return reply(200, { token: session });
+        requireThat(!closing, 'The server is restarting. Try again shortly.', 503);
+        const token = sessionToken(req);
+        const session = store.session(token);
+        if (path === '/api/status' && req.method === 'GET') return reply(200, { initialized: store.accounts.length > 0, authentication: 'accounts' });
+        if (path === '/api/auth/session' && req.method === 'GET') {
+          if (!session && token) setCookie(res, null);
+          return reply(200, { user: session ? store.publicUser(session.account) : null, csrf: session?.csrf ?? null, legacyAvailable: store.legacyAvailable });
+        }
+        if (['/api/auth/signup', '/api/auth/login'].includes(path) && req.method === 'POST') {
+          requireThat(req.headers.origin === origin, 'Open the app to sign in.', 403);
+          rateLimit(`auth:${req.socket.remoteAddress}`, 30);
+          rateLimit(`email:${String(body.email || '').trim().toLowerCase()}`, 8);
+          const account = path === '/api/auth/signup' ? await store.signup(body) : await store.login(body);
+          requireThat(!closing, 'The server is restarting. Please log in again.', 503);
+          store.logout(token);
+          const next = store.createSession(account);
+          setCookie(res, next.token);
+          return reply(path.endsWith('signup') ? 201 : 200, { user: store.publicUser(account), csrf: next.csrf, legacyAvailable: store.legacyAvailable });
         }
         const agentMatch = path.match(/^\/api\/agent\/([a-f0-9]{32})\/execute$/);
         if (agentMatch && req.method === 'POST') {
           const pass = passes.get(agentMatch[1]);
-          requireThat(pass && passState(pass) === 'ready' && vault.unlocked && !closing, 'This pass is unavailable, expired, or already used.', 410);
+          const account = pass && store.accounts.find(item => item.id === pass.accountId);
+          requireThat(account && passState(pass) === 'ready' && !closing, 'This pass is unavailable, expired, or already used.', 410);
+          const vault = store.workspace(account);
           requireThat(typeof body.pin === 'string' && body.pin.length <= 64, 'A valid PIN is required.', 401);
           const candidate = digest(body.pin.replace(/[\s-]/g, ''));
-          if (!equal(candidate, pass.pinHash)) {
+          if (!equal(candidate, Buffer.from(pass.pinHash, 'hex'))) {
             pass.attempts++;
             if (pass.attempts >= 5) { pass.status = 'revoked'; vault.audit('Pass revoked', 'Five unsuccessful PIN attempts.'); }
+            store.save();
             throw new HttpError(401, 'Incorrect PIN.');
           }
           const entry = vault.data.entries.find(item => item.id === pass.entryId);
           requireThat(entry, 'The vault item was removed.', 410);
           // A key has no destination. Reserve it while validating the URL supplied at use time.
           // Concurrent redemptions cannot pass this reservation, and validation errors are retryable.
-          pass.status = 'validating';
+          pass.status = 'validating'; store.save();
           let target, resolvedAddress;
           try {
             ({ target, resolvedAddress } = await validateTarget(body.target, origin));
-            requireThat(pass.status === 'validating' && vault.unlocked && !closing && pass.expiresAt > now(), 'This pass is unavailable or expired.', 410);
+            requireThat(pass.status === 'validating' && !closing && pass.expiresAt > now(), 'This pass is unavailable or expired.', 410);
             requireThat(vault.data.entries.includes(entry), 'This item changed. Ask the owner for a new pass.', 410);
             requireThat(entry.type !== 'login' || new URL(target).origin === entry.site, 'A login can only be filled on its saved website.');
           } catch (error) {
-            if (pass.status === 'validating') pass.status = vault.unlocked && !closing ? 'ready' : 'revoked';
+            if (pass.status === 'validating') pass.status = !closing ? 'ready' : 'failed';
+            store.save();
             throw error;
           }
           // Consume before browser work. A failed fill still consumes the PIN.
-          pass.status = 'running'; pass.pinHash.fill(0);
+          pass.status = 'running'; pass.pinHash = ''; store.save();
           const values = Object.fromEntries(pass.mappings.map(({ field }) => [field, entry.values[field]]));
           vault.audit('Pass redeemed', `${pass.label} · ${new URL(target).origin}`);
           try {
-            const result = await runner.fill({ target, mappings: pass.mappings, values, resolvedAddress });
+            const result = await runnerFor(account.id).fill({ target, mappings: pass.mappings, values, resolvedAddress });
             pass.status = 'used';
-            if (vault.unlocked) vault.audit('Autofill completed', `${pass.label} · ${result.filled} fields`);
+            vault.audit('Autofill completed', `${pass.label} · ${result.filled} fields`);
             return reply(200, { status: 'filled', fieldsFilled: result.filled, message: 'Filled in the owner’s private browser. The owner must review and submit. No values are returned.' });
           } catch {
             pass.status = 'failed';
-            if (vault.unlocked) vault.audit('Autofill failed', pass.label);
+            vault.audit('Autofill failed', pass.label);
             throw new HttpError(422, 'Private fill failed. The PIN is consumed. Ask the owner to check the destination and selectors and create a new pass.');
           } finally { for (const field of Object.keys(values)) values[field] = ''; }
         }
-        requireThat(session && req.headers.authorization && equal(digest(req.headers.authorization), digest(`Bearer ${session}`)), 'Unlock your vault to continue.', 401);
-        requireThat(vault.unlocked && !closing, 'Vault is locked.', 401);
-        lastActive = now();
-        if (path === '/api/vault' && req.method === 'GET') return reply(200, { entries: vault.metadata(), passes: [...passes.values()].map(passMetadata).reverse(), activity: vault.data.activity });
-        if (path === '/api/lock' && req.method === 'POST') { await lock(); return reply(200, { locked: true }); }
+        requireThat(session, 'Log in to your account to continue.', 401);
+        const account = session.account;
+        const vault = store.workspace(account);
+        if (['POST', 'PUT', 'DELETE'].includes(req.method)) {
+          requireThat(req.headers.origin === origin && typeof req.headers['x-csrf-token'] === 'string' && equal(digest(req.headers['x-csrf-token']), digest(session.csrf)), 'Refresh the app and try again.', 403);
+        }
+        if (path === '/api/vault' && req.method === 'GET') return reply(200, { entries: vault.metadata(), passes: [...passes.values()].filter(pass => pass.accountId === account.id).map(passMetadata).reverse(), activity: vault.data.activity, user: store.publicUser(account), legacyAvailable: store.legacyAvailable });
+        if (path === '/api/auth/logout' && req.method === 'POST') { store.logout(token); setCookie(res, null); return reply(200, { loggedOut: true }); }
+        if (path === '/api/account/import-legacy' && req.method === 'POST') {
+          rateLimit(`import:${account.id}`, 5);
+          const imported = store.importLegacy(account, body.password);
+          return reply(200, { imported, legacyAvailable: false });
+        }
         if (path === '/api/entries' && req.method === 'POST') {
-          requireThat(fields[body.type] && text(body.label, 80), 'Choose an item type and a name.');
+          requireThat(Object.hasOwn(fields, body.type) && text(body.label, 80), 'Choose an item type and a name.');
           requireThat(body.values && typeof body.values === 'object' && !Array.isArray(body.values), 'Add at least one field.');
           const prior = body.id ? vault.data.entries.find(entry => entry.id === body.id) : null;
           requireThat(!body.id || prior, 'Item not found.', 404);
@@ -166,7 +193,7 @@ export function createApp({ dataPath = resolve('.data/vault.enc'), runner = new 
             catch { throw new HttpError(400, 'Add the HTTPS website this login belongs to.'); }
           }
           const entry = { id: prior?.id ?? randomBytes(12).toString('hex'), type: body.type, label: body.label.trim(), site, values, updatedAt: new Date(now()).toISOString() };
-          if (prior) { revokeFor(prior.id); vault.data.entries[vault.data.entries.indexOf(prior)] = entry; }
+          if (prior) { revokeFor(account.id, prior.id); vault.data.entries[vault.data.entries.indexOf(prior)] = entry; }
           else { requireThat(vault.data.entries.length < 500, 'This vault is limited to 500 items.'); vault.data.entries.push(entry); }
           vault.audit(prior ? 'Item updated' : 'Item added', entry.label);
           return reply(200, { saved: true });
@@ -175,13 +202,13 @@ export function createApp({ dataPath = resolve('.data/vault.enc'), runner = new 
         if (itemMatch && req.method === 'DELETE') {
           const entry = vault.data.entries.find(item => item.id === itemMatch[1]);
           requireThat(entry, 'Item not found.', 404);
-          revokeFor(entry.id);
+          revokeFor(account.id, entry.id);
           vault.data.entries = vault.data.entries.filter(item => item.id !== entry.id);
           vault.audit('Item removed', entry.label);
           return reply(200, { deleted: true });
         }
         if (path === '/api/passes' && req.method === 'POST') {
-          requireThat(passes.size < 200, 'Pass limit reached. Restart the server to clear old passes.');
+          requireThat([...passes.values()].filter(pass => pass.accountId === account.id && ['ready', 'validating', 'running'].includes(passState(pass))).length < 200, 'Active key limit reached. Revoke unused keys first.');
           const entry = vault.data.entries.find(item => item.id === body.entryId);
           requireThat(entry, 'Select a vault item.');
           requireThat(Array.isArray(body.mappings) && body.mappings.length > 0 && body.mappings.length <= 10, 'Choose at least one field.');
@@ -196,7 +223,7 @@ export function createApp({ dataPath = resolve('.data/vault.enc'), runner = new 
           requireThat(Number.isInteger(minutes) && minutes >= 5 && minutes <= MAX_EXPIRY_MINUTES, 'Choose an expiration between 5 minutes and 30 days.');
           const pin = Array.from({ length: 4 }, () => String(randomInt(100000000)).padStart(8, '0')).join('');
           const id = randomBytes(16).toString('hex');
-          const pass = { id, label: text(body.label, 80) ? body.label.trim() : entry.label, entryId: entry.id, mappings, pinHash: digest(pin), attempts: 0, createdAt: now(), expiresAt: now() + minutes * 60000, status: 'ready' };
+          const pass = { id, accountId: account.id, label: text(body.label, 80) ? body.label.trim() : entry.label, entryId: entry.id, mappings, pinHash: digest(pin).toString('hex'), attempts: 0, createdAt: now(), expiresAt: now() + minutes * 60000, status: 'ready' };
           passes.set(id, pass);
           vault.audit('Pass created', pass.label);
           const agentUrl = `${origin}/agent/${id}`;
@@ -208,8 +235,8 @@ export function createApp({ dataPath = resolve('.data/vault.enc'), runner = new 
         const revokeMatch = path.match(/^\/api\/passes\/([a-f0-9]{32})\/revoke$/);
         if (revokeMatch && req.method === 'POST') {
           const pass = passes.get(revokeMatch[1]);
-          requireThat(pass && ['ready', 'validating'].includes(passState(pass)), 'This pass is no longer active.', 409);
-          pass.status = 'revoked'; pass.pinHash.fill(0); vault.audit('Pass revoked', pass.label);
+          requireThat(pass && pass.accountId === account.id && ['ready', 'validating'].includes(passState(pass)), 'This pass is no longer active.', 409);
+          pass.status = 'revoked'; pass.pinHash = ''; vault.audit('Pass revoked', pass.label);
           return reply(200, { revoked: true });
         }
         throw new HttpError(404, 'Not found.');
@@ -226,6 +253,13 @@ export function createApp({ dataPath = resolve('.data/vault.enc'), runner = new 
   });
   server.requestTimeout = 15000;
   server.headersTimeout = 10000;
-  server.on('close', () => { clearInterval(maintenance); void lock(); });
-  return { server, vault, close: async () => { clearInterval(maintenance); await lock(); await new Promise(resolve => server.close(resolve)); } };
+  server.on('close', () => { clearInterval(maintenance); });
+  return { server, store, close: async () => {
+    closing = true;
+    clearInterval(maintenance);
+    await Promise.allSettled([...new Set(runners.values())].map(browser => browser.closeAll()));
+    await new Promise(resolve => server.close(resolve));
+    store.close();
+  } };
+
 }
