@@ -14,11 +14,6 @@ button svg{width:17px;height:17px}
 .brand{display:flex;align-items:center;gap:8px;font-size:19px;font-weight:650;letter-spacing:-.8px;padding:0 4px 28px;text-decoration:none;color:var(--ink)}
 .brandmark{width:29px;height:31px;flex-shrink:0;background:var(--accent);border-radius:10px;display:grid;place-items:center;color:#f5f5f5}
 .brandmark svg{width:25px;height:25px;fill:currentColor;stroke:none}
-.workspace{display:flex;align-items:center;gap:10px;border:1px solid var(--border);padding:11px;border-radius:8px;font-size:12px;margin-bottom:30px}
-.workspace>span:first-child{background:#f5f5f5;padding:8px;border-radius:6px;font-size:11px;font-weight:600}
-.workspace strong{display:block;font-size:12px;margin-bottom:3px}
-.workspace small{color:var(--muted);font-size:10px}
-.workspace>svg{margin-left:auto;width:14px}
 .nav-label,.eyebrow{text-transform:uppercase;font-size:10px;letter-spacing:1.6px;font-weight:650;color:#737373;margin:0 13px 12px}
 .nav-item{display:flex;align-items:center;gap:12px;width:100%;text-align:left;padding:12px;border-radius:7px;background:transparent;color:#525252;font-size:13px;margin-bottom:4px}
 .nav-item.active{background:#f5f5f5;color:#262626;font-weight:600}
@@ -29,10 +24,13 @@ button svg{width:17px;height:17px}
 .local-card p{font-size:11px;margin:0 0 8px;font-weight:600}
 .local-card small{font-size:10px;color:#737373}
 .dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:#737373;margin-right:6px}
-.owner{display:flex;align-items:center;gap:9px;font-size:12px;padding:14px 10px 0}
+.owner{display:flex;align-items:center;gap:4px;font-size:12px;padding-top:14px}
 .avatar{background:#f5f5f5;color:#525252;width:31px;height:31px;display:grid;place-items:center;border-radius:50%;font-size:10px;font-weight:600}
 .owner small{display:block;font-size:10px;color:#737373;margin-top:3px}
-.owner button{margin-left:auto;background:none;color:#737373}
+.owner .logout-button{flex-shrink:0;background:none;color:#737373;padding:6px}
+.owner .profile-button{display:flex;align-items:center;gap:9px;flex:1;min-width:0;text-align:left;padding:8px;border-radius:7px;background:transparent;color:var(--ink)}
+.owner .profile-button:hover,.owner .profile-button.active{background:#f5f5f5}
+.profile-button .avatar{flex-shrink:0}
 .shell{margin-left:228px}
 .topbar{height:79px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 44px;background:#ffffff}
 .breadcrumb{display:flex;align-items:center;gap:12px;font-size:12px;color:#737373}
@@ -233,8 +231,6 @@ dialog::backdrop{background:#17171758;backdrop-filter:blur(4px)}
 .handoff-card{padding:22px}
 .sidebar{width:180px}
 .shell{margin-left:180px}
-.workspace{padding:9px;gap:7px}
-.workspace>svg{display:none}
 .brand{padding-left:9px}
 .page-heading{gap:14px}
 .intro-banner{align-items:flex-start;flex-wrap:wrap}
@@ -247,7 +243,7 @@ dialog::backdrop{background:#17171758;backdrop-filter:blur(4px)}
 }
 
 @media(max-width:600px){.sidebar{position:fixed;inset:auto 0 0 0;width:100%;height:65px;padding:7px 8px;flex-direction:row;border-top:1px solid var(--border);border-right:0;justify-content:space-around}
-.sidebar>.brand,.workspace,.nav-label,.sidebar-bottom{display:none}
+.sidebar>.brand,.nav-label{display:none}
 .sidebar nav{display:contents}
 .nav-item{flex-direction:column;gap:5px;padding:5px;font-size:9px;width:auto;flex:1;margin:0;border-radius:7px}
 .nav-item svg{width:18px;height:18px}
@@ -353,3 +349,11 @@ h1{font-size:26px}
 .forgot-row{display:flex;justify-content:flex-end;margin:-4px 0 18px}
 .forgot-row .text-btn{font-size:12px}
 .recovery-code{width:100%;resize:none;word-break:break-all;font-family:monospace;font-size:14px;line-height:1.7;padding:12px;border:1px solid #ddd;border-radius:6px;background:#fafafa;color:#111}
+
+@media(max-width:600px){
+.sidebar-bottom{display:flex;align-items:center;justify-content:center;margin:0;flex:1;min-width:0}
+.sidebar-bottom>.nav-item,.sidebar-bottom>.local-card,.owner .logout-button{display:none}
+.owner{padding:0;justify-content:center}
+.owner .profile-button{flex:none;justify-content:center;min-width:44px;min-height:44px;padding:6px}
+.profile-button .account-owner{display:none}
+}
