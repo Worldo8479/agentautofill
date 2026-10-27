@@ -115,7 +115,17 @@ export function createApp({ dataPath = resolve('.data/vault.enc'), runner, runne
           store.logout(token);
           const next = store.createSession(account);
           setCookie(res, next.token);
-          return reply(path.endsWith('signup') ? 201 : 200, { user: store.publicUser(account), csrf: next.csrf, legacyAvailable: store.legacyAvailable });
+          const recoveryCode = path.endsWith('signup') ? store.issueRecovery(account) : undefined;
+          return reply(path.endsWith('signup') ? 201 : 200, { user: store.publicUser(account), csrf: next.csrf, legacyAvailable: store.legacyAvailable, recoveryCode });
+        }
+        if (path === '/api/auth/reset-password' && req.method === 'POST') {
+          requireThat(req.headers.origin === origin, 'Open the app to reset your password.', 403);
+          rateLimit(`reset:${req.socket.remoteAddress}`, 15);
+          rateLimit(`reset-email:${String(body.email || '').trim().toLowerCase()}`, 5);
+          const recovered = await store.resetPassword(body);
+          await runners.get(recovered.id)?.closeAll().catch(() => {});
+          if (session?.account.id === recovered.id) setCookie(res, null);
+          return reply(200, { reset: true });
         }
         const agentMatch = path.match(/^\/api\/agent\/([a-f0-9]{32})\/execute$/);
         if (agentMatch && req.method === 'POST') {
@@ -170,6 +180,13 @@ export function createApp({ dataPath = resolve('.data/vault.enc'), runner, runne
         }
         if (path === '/api/vault' && req.method === 'GET') return reply(200, { entries: vault.metadata(), passes: [...passes.values()].filter(pass => pass.accountId === account.id).map(passMetadata).reverse(), activity: vault.data.activity, user: store.publicUser(account), legacyAvailable: store.legacyAvailable });
         if (path === '/api/auth/logout' && req.method === 'POST') { store.logout(token); setCookie(res, null); return reply(200, { loggedOut: true }); }
+        if (path === '/api/account/recovery-code' && req.method === 'POST') {
+          rateLimit(`recovery:${account.id}`, 5);
+          try { await store.login({ email: account.email, password: body.password }); }
+          catch { throw new HttpError(400, 'Your current password is incorrect.'); }
+          requireThat(store.session(token), 'Log in again to continue.', 401);
+          return reply(200, { recoveryCode: store.issueRecovery(account), user: store.publicUser(account) });
+        }
         if (path === '/api/account/import-legacy' && req.method === 'POST') {
           rateLimit(`import:${account.id}`, 5);
           const imported = store.importLegacy(account, body.password);

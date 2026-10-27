@@ -29,7 +29,14 @@ No external API keys, model subscriptions, email provider, or build step are req
 3. Refreshing the page preserves login through an HttpOnly cookie. Sessions expire seven days after login. **Log out** invalidates the current browser session; other signed-in browsers remain signed in.
 4. After a server restart, log in again. Account records, saved details, and unexpired keys persist.
 
-These are accounts for this local installation, not cloud accounts. Email is a login identifier: email verification, password reset, and account recovery are not implemented. Keep your password safe.
+These are accounts for this local installation, not cloud accounts. Email is a login identifier and is not verified. Password resets use a saved recovery code; no email service is configured.
+
+### Forgot password
+
+- Signup shows a random 256-bit recovery code once. Store it outside this app; do not share it with an agent. Only its SHA-256 hash is persisted.
+- Existing users should log in and select **Account → Set up recovery code**, confirming their current password. Replacing a code invalidates the old one.
+- On the login screen, choose **Forgot password?**, enter your email, saved recovery code, and a new password of at least 12 characters. A successful reset consumes the code, ends all account sessions, revokes unused agent keys, and closes existing private browser windows. Saved items remain intact. Log in and generate a new recovery code afterward.
+- Recovery works on localhost and survives server restarts. Invalid emails/codes receive the same error; reset attempts are rate limited. Without a saved code or the current password, there is no self-service reset.
 
 ### Import your previous vault
 

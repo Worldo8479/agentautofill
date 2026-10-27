@@ -274,6 +274,7 @@ test('accounts and one-use keys survive server restart without exposing password
   assert.ok(!disk.includes(password));
   assert.ok(!disk.includes('owner@example.com'));
   assert.ok(!disk.includes(pass.pin));
+  assert.ok(!disk.includes(f.signup.body.recoveryCode));
   assert.ok(!disk.includes('NeverReturnThisSecret'));
   await f.app.close();
   let fills = 0;
@@ -297,5 +298,69 @@ test('accounts and one-use keys survive server restart without exposing password
   try {
     const response = await fetch(`http://127.0.0.1:${third.server.address().port}/api/agent/${pass.id}/execute`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pin: pass.pin, target: `${origin}/demo` }) });
     assert.equal(response.status, 410);
+    const thirdOrigin = `http://127.0.0.1:${third.server.address().port}`;
+    const reset = await fetch(`${thirdOrigin}/api/auth/reset-password`, { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: thirdOrigin }, body: JSON.stringify({ email: 'owner@example.com', recoveryCode: f.signup.body.recoveryCode, password: 'recovered-after-restart' }) });
+    assert.equal(reset.status, 200);
   } finally { await third.close(); }
+  const fourth = createApp({ dataPath: join(f.dir, 'vault.enc') });
+  try {
+    await assert.rejects(fourth.store.resetPassword({ email: 'owner@example.com', recoveryCode: f.signup.body.recoveryCode, password: 'another-new-password' }), /already been used/);
+    assert.equal((await fourth.store.login({ email: 'owner@example.com', password: 'recovered-after-restart' })).entries.length, 1);
+  } finally { await fourth.close(); }
+});
+
+test('recovery codes reset once, preserve items, and invalidate sessions and unused keys', async t => {
+  const f = await fixture(t);
+  const code = f.signup.body.recoveryCode;
+  assert.match(code, /^[A-F0-9]{8}(?:-[A-F0-9]{8}){7}$/);
+  assert.equal(f.signup.body.user.recoveryReady, true);
+  const originalSession = f.credentials();
+  const pass = (await f.grant()).body;
+  const second = await f.request('/api/auth/login', { email: 'owner@example.com', password }, { owner: false });
+  const secondCookie = second.headers.get('set-cookie').split(';')[0];
+  const other = await f.request('/api/auth/signup', { name: 'Other', email: 'other@example.com', password }, { owner: false });
+  const otherCookie = other.headers.get('set-cookie').split(';')[0];
+  const resetBody = { email: 'OWNER@example.com', recoveryCode: code.toLowerCase(), password: 'replacement-password-2026' };
+  const results = await Promise.all([f.request('/api/auth/reset-password', resetBody, { owner: false }), f.request('/api/auth/reset-password', resetBody, { owner: false })]);
+  assert.deepEqual(results.map(r => r.status).sort(), [200, 400]);
+  for (const cookie of [originalSession.cookie, secondCookie]) assert.equal((await f.request('/api/vault', undefined, { headers: { Cookie: cookie } })).status, 401);
+  assert.equal((await f.request('/api/vault', undefined, { headers: { Cookie: otherCookie } })).status, 200);
+  assert.equal((await f.request(`/api/agent/${pass.id}/execute`, { pin: pass.pin, target: `${f.origin}/demo` }, { owner: false })).status, 410);
+  assert.equal((await f.request('/api/auth/login', { email: 'owner@example.com', password })).status, 401);
+  assert.equal((await f.request('/api/auth/login', { email: 'owner@example.com', password: resetBody.password })).status, 200);
+  const vault = (await f.request('/api/vault')).body;
+  assert.equal(vault.entries[0].id, f.entry.id);
+  assert.equal(vault.user.recoveryReady, false);
+  assert.ok(!JSON.stringify(vault).includes(code));
+  assert.ok(!JSON.stringify(f.app.store.accounts).includes(code));
+  assert.equal((await f.request('/api/auth/reset-password', resetBody)).status, 400);
+});
+
+test('recovery setup requires a session, CSRF, and password; rotation invalidates old codes', async t => {
+  const f = await fixture(t);
+  const oldCode = f.signup.body.recoveryCode;
+  assert.equal((await f.request('/api/account/recovery-code', { password }, { owner: false })).status, 401);
+  assert.equal((await f.request('/api/account/recovery-code', { password }, { headers: { 'X-CSRF-Token': 'wrong' } })).status, 403);
+  assert.equal((await f.request('/api/account/recovery-code', { password: 'wrong' })).status, 400);
+  const result = await f.request('/api/account/recovery-code', { password });
+  assert.equal(result.status, 200);
+  assert.notEqual(result.body.recoveryCode, oldCode);
+  const reset = recoveryCode => ({ email: 'owner@example.com', recoveryCode, password: 'new-password-for-recovery' });
+  assert.equal((await f.request('/api/auth/reset-password', reset(oldCode), { owner: false })).status, 400);
+  assert.equal((await f.request('/api/auth/reset-password', reset(result.body.recoveryCode), { owner: false, headers: { Origin: 'https://example.com' } })).status, 403);
+  assert.equal((await f.request('/api/auth/reset-password', { ...reset(result.body.recoveryCode), password: 'short' }, { owner: false })).status, 400);
+  assert.equal((await f.request('/api/auth/reset-password', reset(result.body.recoveryCode), { owner: false })).status, 200);
+});
+
+test('invalid recovery attempts are generic, rate limited, and never consume a valid code', async t => {
+  const f = await fixture(t);
+  const body = { email: 'owner@example.com', recoveryCode: 'incorrect', password: 'replacement-password-2026' };
+  const wrong = await f.request('/api/auth/reset-password', body, { owner: false });
+  const unknown = await f.request('/api/auth/reset-password', { ...body, email: 'unknown@example.com' }, { owner: false });
+  assert.equal(wrong.status, 400);
+  assert.deepEqual(wrong.body, unknown.body);
+  for (let i = 0; i < 4; i++) assert.equal((await f.request('/api/auth/reset-password', body, { owner: false })).status, 400);
+  assert.equal((await f.request('/api/auth/reset-password', body, { owner: false })).status, 429);
+  assert.equal((await f.request('/api/vault')).status, 200);
+  assert.equal((await f.request('/api/vault')).body.user.recoveryReady, true);
 });

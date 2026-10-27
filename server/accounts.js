@@ -38,7 +38,7 @@ export class AccountStore {
   }
   get accounts() { return this.database.data.accounts; }
   get legacyAvailable() { return !!this.legacyPath && existsSync(this.legacyPath) && !this.database.data.legacyOwnerId; }
-  publicUser(account) { return { id: account.id, name: account.name, email: account.email }; }
+  publicUser(account) { return { id: account.id, name: account.name, email: account.email, recoveryReady: !!account.recoveryHash }; }
   save() { this.database.data.passes = [...this.passes.values()]; this.database.save(); }
   async signup({ name, email, password }) {
     email = normalizeEmail(email);
@@ -66,6 +66,34 @@ export class AccountStore {
     const valid = timingSafeEqual(verifier, expected);
     verifier.fill(0);
     check(account && valid, 401, 'Email or password is incorrect.');
+    return account;
+  }
+  issueRecovery(account) {
+    const code = randomBytes(32).toString('hex').toUpperCase().match(/.{8}/g).join('-');
+    account.recoveryHash = hash(code.replaceAll('-', ''));
+    this.workspace(account).audit('Recovery code created', 'Any previous recovery code has been replaced.');
+    return code;
+  }
+  async resetPassword({ email, recoveryCode, password }) {
+    check(typeof password === 'string' && password.length >= 12 && password.length <= 1024, 400, 'Use a password of 12 to 1,024 characters.');
+    const account = this.accounts.find(item => item.email === normalizeEmail(email));
+    const expected = account?.recoveryHash;
+    const code = typeof recoveryCode === 'string' && recoveryCode.length <= 200 ? recoveryCode.replace(/[\s-]/g, '').toUpperCase() : '';
+    const valid = timingSafeEqual(Buffer.from(hash(code), 'hex'), Buffer.from(expected || '0'.repeat(64), 'hex'));
+    // Do the same work for unknown accounts and incorrect codes.
+    const salt = randomBytes(32).toString('hex');
+    const verifier = await passwordHash(password, salt);
+    if (!account || !expected || !valid || account.recoveryHash !== expected) {
+      verifier.fill(0);
+      throw new AccountError(400, 'Email or recovery code is incorrect or the code has already been used.');
+    }
+    account.passwordSalt = salt;
+    account.passwordHash = verifier.toString('hex');
+    verifier.fill(0);
+    delete account.recoveryHash;
+    for (const [id, session] of this.sessions) if (session.accountId === account.id) this.sessions.delete(id);
+    for (const pass of this.passes.values()) if (pass.accountId === account.id && ['ready', 'validating'].includes(pass.status)) { pass.status = 'revoked'; pass.pinHash = ''; }
+    this.workspace(account).audit('Password reset', 'All sessions ended and unused agent keys revoked. Generate a new recovery code after login.');
     return account;
   }
   createSession(account) {

@@ -349,3 +349,7 @@ h1{font-size:26px}
 @media(max-width:900px){.auth-story{padding:35px}.auth-form-area{padding:40px 30px}.auth-story-content h1{font-size:40px}.auth-feature{font-size:11px;line-height:1.6}}
 @media(max-width:700px){.auth-page{grid-template-columns:1fr}.auth-story{min-height:auto;padding:26px 25px;border-right:0;border-bottom:1px solid #e5e5e5;background:#fff}.auth-story-content,.auth-local{display:none}.auth-story>.brand{font-size:20px}.auth-form-area{padding:36px 25px 45px;align-items:start}.auth-card{max-width:420px}.auth-card>h2{font-size:28px}.auth-tabs{margin-bottom:28px}.auth-card .field input{font-size:16px}.auth-description{font-size:12px}}
 
+
+.forgot-row{display:flex;justify-content:flex-end;margin:-4px 0 18px}
+.forgot-row .text-btn{font-size:12px}
+.recovery-code{width:100%;resize:none;word-break:break-all;font-family:monospace;font-size:14px;line-height:1.7;padding:12px;border:1px solid #ddd;border-radius:6px;background:#fafafa;color:#111}
