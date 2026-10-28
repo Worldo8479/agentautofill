@@ -364,3 +364,82 @@ test('invalid recovery attempts are generic, rate limited, and never consume a v
   assert.equal((await f.request('/api/vault')).status, 200);
   assert.equal((await f.request('/api/vault')).body.user.recoveryReady, true);
 });
+
+test('encrypted form packages carry ciphertext only and accept a submission once without a browser', async t => {
+  const f = await fixture(t);
+  const result = await f.request('/api/packages', { entryId: f.entry.id, fields: ['firstName'], minutes: 43200 });
+  assert.equal(result.status, 201);
+  const pack = result.body;
+  assert.equal(pack.mode, 'encrypted-form');
+  assert.equal(pack.pin, undefined);
+  assert.equal(pack.agentUrl, `${f.origin}/submit/${pack.id}`);
+  assert.ok(!JSON.stringify(pack).includes('NeverReturnThisSecret'));
+  assert.ok(!JSON.stringify(pack).includes('secret-value@example.com'));
+  assert.ok(!JSON.stringify(pack).includes('PRIVATE KEY'));
+  assert.equal((await f.request('/api/vault')).body.passes[0].payload, undefined);
+  assert.equal((await f.request(`/api/agent/${pack.id}/execute`, { pin: pack.payload, target: `${f.origin}/demo` }, { owner: false })).status, 410);
+  await f.request('/api/auth/logout', {});
+  const results = await Promise.all([1, 2].map(() => f.request(`/api/forms/${pack.id}/submit`, { payload: pack.payload }, { owner: false })));
+  assert.deepEqual(results.map(r => r.status).sort(), [200, 410]);
+  const accepted = results.find(r => r.status === 200).body;
+  assert.equal(accepted.fieldsReceived, 1);
+  assert.match(accepted.receiptId, /^[a-f0-9]{32}$/);
+  assert.ok(!JSON.stringify(results).includes('NeverReturnThisSecret'));
+  assert.equal(f.fills(), 0);
+  const owner = f.app.store.accounts[0];
+  assert.deepEqual(owner.submissions[0].values, { firstName: 'NeverReturnThisSecret' });
+  assert.equal(owner.submissions.length, 1);
+  const disk = await readFile(join(f.dir, 'accounts.enc'), 'utf8');
+  assert.ok(!disk.includes('NeverReturnThisSecret'));
+  assert.ok(!disk.includes('PRIVATE KEY'));
+  await f.request('/api/auth/login', { email: 'owner@example.com', password });
+  const metadata = (await f.request('/api/vault')).body;
+  assert.equal(metadata.submissions, undefined);
+  assert.ok(!JSON.stringify(metadata).includes('NeverReturnThisSecret'));
+});
+
+test('encrypted form rejects tampering, wrong form, CSRF, invalid scope, expiry and revoked packages', async t => {
+  let now = Date.now();
+  const f = await fixture(t, { now: () => now });
+  const create = fields => f.request('/api/packages', { entryId: f.entry.id, fields, minutes: 5 });
+  assert.equal((await f.request('/api/packages', { entryId: f.entry.id, fields: ['firstName'], minutes: 5 }, { owner: false })).status, 401);
+  assert.equal((await f.request('/api/packages', { entryId: f.entry.id, fields: ['firstName'], minutes: 5 }, { headers: { 'X-CSRF-Token': 'bad' } })).status, 403);
+  for (const fields of [[], ['missing'], ['firstName', 'firstName'], ['__proto__']]) assert.equal((await create(fields)).status, 400);
+  const a = (await create(['firstName'])).body;
+  const b = (await create(['firstName'])).body;
+  const submit = (pack, payload = pack.payload, options = {}) => f.request(`/api/forms/${pack.id}/submit`, { payload }, { owner: false, ...options });
+  assert.equal((await submit(a, b.payload)).status, 400);
+  assert.equal((await submit(a, `${a.payload.slice(0, -3)}xxx`)).status, 400);
+  assert.equal((await submit(a, a.payload, { headers: { Origin: 'https://other.example' } })).status, 403);
+  assert.equal((await f.request(`/api/forms/${a.id}/submit`)).status, 404);
+  await f.request(`/api/passes/${a.id}/revoke`, {});
+  assert.equal((await submit(a)).status, 410);
+  now += 5 * 60000;
+  assert.equal((await submit(b)).status, 410);
+  assert.equal(f.app.store.accounts[0].submissions, undefined);
+  const c = (await create(['firstName'])).body;
+  await f.request('/api/entries', { id: f.entry.id, type: 'identity', label: 'Edited', values: { firstName: 'Changed secret' } });
+  assert.equal((await submit(c)).status, 410);
+});
+
+test('receiver key, package expiry and single use survive server restarts', async t => {
+  const f = await fixture(t);
+  const pack = (await f.request('/api/packages', { entryId: f.entry.id, fields: ['firstName'], minutes: 43200 })).body;
+  await f.app.close();
+  const restarted = createApp({ dataPath: join(f.dir, 'vault.enc') });
+  await new Promise(resolve => restarted.server.listen(0, '127.0.0.1', resolve));
+  try {
+    const origin = `http://127.0.0.1:${restarted.server.address().port}`;
+    const response = await fetch(`${origin}/api/forms/${pack.id}/submit`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ payload: pack.payload }) });
+    assert.equal(response.status, 200);
+    assert.equal(restarted.store.accounts[0].submissions.length, 1);
+  } finally { await restarted.close(); }
+  const third = createApp({ dataPath: join(f.dir, 'vault.enc') });
+  await new Promise(resolve => third.server.listen(0, '127.0.0.1', resolve));
+  try {
+    const origin = `http://127.0.0.1:${third.server.address().port}`;
+    const response = await fetch(`${origin}/api/forms/${pack.id}/submit`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ payload: pack.payload }) });
+    assert.equal(response.status, 410);
+    assert.deepEqual(third.store.accounts[0].submissions[0].values, { firstName: 'NeverReturnThisSecret' });
+  } finally { await third.close(); }
+});

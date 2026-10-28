@@ -1,10 +1,11 @@
 import { createServer } from 'node:http';
-import { randomBytes, randomInt, createHash, timingSafeEqual } from 'node:crypto';
+import { randomBytes, randomInt, createHash, timingSafeEqual, createPublicKey } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { resolve, dirname } from 'node:path';
 import { lookup } from 'node:dns/promises';
 import { AccountStore } from './accounts.js';
 import { PrivateRunner } from './runner.js';
+import { newRecipientKey, seal, unseal } from './envelope.js';
 
 const publicDir = resolve(import.meta.dirname, '../public');
 const digest = value => createHash('sha256').update(value).digest();
@@ -45,7 +46,7 @@ export function createApp({ dataPath = resolve('.data/vault.enc'), runner, runne
     return runners.get(accountId);
   };
   const passState = pass => pass.status === 'ready' && pass.expiresAt <= now() ? 'expired' : pass.status;
-  const passMetadata = pass => ({ id: pass.id, label: pass.label, entryId: pass.entryId, fields: pass.mappings.map(m => m.field), createdAt: pass.createdAt, expiresAt: pass.expiresAt, status: passState(pass) });
+  const passMetadata = pass => ({ id: pass.id, label: pass.label, entryId: pass.entryId, mode: pass.mode || 'private-browser', fields: pass.mappings.map(m => m.field), createdAt: pass.createdAt, expiresAt: pass.expiresAt, status: passState(pass) });
   function revokeFor(accountId, entryId) { for (const pass of passes.values()) if (pass.accountId === accountId && pass.entryId === entryId && ['ready', 'validating'].includes(pass.status)) pass.status = 'revoked'; }
   function rateLimit(key, limit) {
     const recent = (attempts.get(key) || []).filter(at => now() - at < 60000);
@@ -127,11 +128,38 @@ export function createApp({ dataPath = resolve('.data/vault.enc'), runner, runne
           if (session?.account.id === recovered.id) setCookie(res, null);
           return reply(200, { reset: true });
         }
+        const submissionMatch = path.match(/^\/api\/forms\/([a-f0-9]{32})\/submit$/);
+        if (submissionMatch && req.method === 'POST') {
+          rateLimit(`submission:${req.socket.remoteAddress}`, 60);
+          const pass = passes.get(submissionMatch[1]);
+          requireThat(pass?.mode === 'encrypted-form' && passState(pass) === 'ready', 'This package is unavailable, expired, or already submitted.', 410);
+          requireThat(typeof body.payload === 'string' && body.payload.length <= 60000 && equal(digest(body.payload), Buffer.from(pass.payloadHash, 'hex')), 'Invalid encrypted package.', 400);
+          const owner = store.accounts.find(item => item.id === pass.accountId);
+          requireThat(owner?.entries.some(item => item.id === pass.entryId), 'This package is unavailable.', 410);
+          // No await between verification, reservation, and persistence: concurrent submissions cannot both proceed.
+          pass.status = 'running'; store.save();
+          let submitted;
+          try {
+            submitted = unseal(store.database.data.recipientPrivateKey, pass.id, body.payload);
+            requireThat(submitted && typeof submitted === 'object' && !Array.isArray(submitted) && Object.keys(submitted).length === pass.mappings.length && pass.mappings.every(({ field }) => Object.hasOwn(submitted, field) && typeof submitted[field] === 'string'), 'Invalid encrypted package.');
+            const receipt = { id: randomBytes(16).toString('hex'), passId: pass.id, receivedAt: now(), values: submitted };
+            owner.submissions ??= [];
+            owner.submissions.unshift(receipt);
+            owner.submissions = owner.submissions.slice(0, 100);
+            pass.status = 'used'; pass.payloadHash = '';
+            store.workspace(owner).audit('Encrypted form submitted', `${pass.label} · ${pass.mappings.length} fields received. Receipt ${receipt.id}`);
+            return reply(200, { status: 'accepted', receiptId: receipt.id, fieldsReceived: pass.mappings.length, message: 'The receiving server accepted and stored the submission encrypted at rest. No decrypted values are returned.' });
+          } catch {
+            pass.status = 'failed'; pass.payloadHash = '';
+            store.save();
+            throw new HttpError(422, 'Submission failed. This package is consumed. Ask the owner for a new package.');
+          }
+        }
         const agentMatch = path.match(/^\/api\/agent\/([a-f0-9]{32})\/execute$/);
         if (agentMatch && req.method === 'POST') {
           const pass = passes.get(agentMatch[1]);
           const account = pass && store.accounts.find(item => item.id === pass.accountId);
-          requireThat(account && passState(pass) === 'ready' && !closing, 'This pass is unavailable, expired, or already used.', 410);
+          requireThat(account && pass.mode !== 'encrypted-form' && passState(pass) === 'ready' && !closing, 'This pass is unavailable, expired, or already used.', 410);
           const vault = store.workspace(account);
           requireThat(typeof body.pin === 'string' && body.pin.length <= 64, 'A valid PIN is required.', 401);
           const candidate = digest(body.pin.replace(/[\s-]/g, ''));
@@ -224,6 +252,25 @@ export function createApp({ dataPath = resolve('.data/vault.enc'), runner, runne
           vault.audit('Item removed', entry.label);
           return reply(200, { deleted: true });
         }
+        if (path === '/api/packages' && req.method === 'POST') {
+          requireThat([...passes.values()].filter(pass => pass.accountId === account.id && ['ready', 'validating', 'running'].includes(passState(pass))).length < 200, 'Active key limit reached. Revoke unused keys first.');
+          const entry = vault.data.entries.find(item => item.id === body.entryId);
+          requireThat(entry, 'Select a vault item.');
+          requireThat(Array.isArray(body.fields) && body.fields.length > 0 && body.fields.length <= 10 && new Set(body.fields).size === body.fields.length && body.fields.every(field => typeof field === 'string' && Object.hasOwn(entry.values, field)), 'Select valid fields to include.');
+          const minutes = Number(body.minutes);
+          requireThat(Number.isInteger(minutes) && minutes >= 5 && minutes <= MAX_EXPIRY_MINUTES, 'Choose an expiration between 5 minutes and 30 days.');
+          store.database.data.recipientPrivateKey ??= newRecipientKey();
+          const id = randomBytes(16).toString('hex');
+          const payload = seal(createPublicKey(store.database.data.recipientPrivateKey), id, Object.fromEntries(body.fields.map(field => [field, entry.values[field]])));
+          requireThat(payload.length <= 60000, 'This package is too large. Select fewer fields.');
+          const pass = { id, accountId: account.id, entryId: entry.id, label: text(body.label, 80) ? body.label.trim() : entry.label, mode: 'encrypted-form', mappings: body.fields.map(field => ({ field })), payloadHash: digest(payload).toString('hex'), createdAt: now(), expiresAt: now() + minutes * 60000, status: 'ready' };
+          passes.set(id, pass);
+          vault.audit('Encrypted package created', `${pass.label} · agentautofill receiving form`);
+          const agentUrl = `${origin}/submit/${id}`;
+          const endpoint = `${origin}/api/forms/${id}/submit`;
+          const prompt = `Submit this encrypted package unchanged to the agentautofill receiving form.\n\nForm: ${agentUrl}\nEndpoint: ${endpoint}\nExpires: ${new Date(pass.expiresAt).toISOString()}\n\nEncrypted package:\n${payload}\n\nOpen the form, paste the package, and click Submit encrypted package. Or POST JSON {"payload":"<the exact encrypted package above>"} to the endpoint with Content-Type: application/json. The receiving server decrypts only during submission and stores the submitted fields encrypted at rest. You receive a receipt and field count, never plaintext or a decryption key. Submit once; do not retry a consumed package. This package works only with this receiving form, not an arbitrary website. Localhost is reachable only on the owner's computer; use an authorized local tool if needed. Do not request keys or access the server's files, memory, account session, or stored submissions.`;
+          return reply(201, { ...passMetadata(pass), payload, agentUrl, endpoint, prompt });
+        }
         if (path === '/api/passes' && req.method === 'POST') {
           requireThat([...passes.values()].filter(pass => pass.accountId === account.id && ['ready', 'validating', 'running'].includes(passState(pass))).length < 200, 'Active key limit reached. Revoke unused keys first.');
           const entry = vault.data.entries.find(item => item.id === body.entryId);
@@ -259,8 +306,8 @@ export function createApp({ dataPath = resolve('.data/vault.enc'), runner, runne
         throw new HttpError(404, 'Not found.');
       }
       requireThat(req.method === 'GET', 'Method not allowed.', 405);
-      const routes = { '/': 'index.html', '/app.js': 'app.js', '/styles.css': 'styles.css', '/agent.js': 'agent.js', '/demo': 'demo.html', '/demo.js': 'demo.js', '/favicon.svg': 'favicon.svg' };
-      const file = /^\/agent\/[a-f0-9]{32}$/.test(path) ? 'agent.html' : routes[path];
+      const routes = { '/': 'index.html', '/app.js': 'app.js', '/styles.css': 'styles.css', '/agent.js': 'agent.js', '/submission.js': 'submission.js', '/demo': 'demo.html', '/demo.js': 'demo.js', '/favicon.svg': 'favicon.svg' };
+      const file = /^\/submit\/[a-f0-9]{32}$/.test(path) ? 'submission.html' : /^\/agent\/[a-f0-9]{32}$/.test(path) ? 'agent.html' : routes[path];
       requireThat(file, 'Not found.', 404);
       const ext = file.split('.').pop();
       const mime = { html: 'text/html', js: 'text/javascript', css: 'text/css', svg: 'image/svg+xml' }[ext];

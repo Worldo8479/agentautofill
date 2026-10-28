@@ -1,10 +1,10 @@
 # agentautofill
 
-A local web app with signup, login, account-specific autofill records, and single-use agent keys. An agent can trigger a private form fill without receiving saved values through the API.
+A local web app with signup, login, account-specific autofill records, and single-use agent keys. An agent can pass encrypted field values to this app’s receiving form without receiving a decryption key or plaintext response.
 
 ## Run
 
-Requires Node.js 22+ and a graphical desktop for private browser windows.
+Requires Node.js 22+. Only legacy private-browser passes require a graphical desktop and Chrome or Chromium.
 
 ```sh
 npm install
@@ -44,26 +44,36 @@ The previous `.data/vault.enc` file is preserved. After creating an account, use
 
 Do not delete the original until you have verified your imported items and made a backup. Old in-memory passes from the pre-account app cannot be recovered; create new keys after importing.
 
-## Create and use an agent key
+## Create and submit an encrypted package
 
-1. Add a login, identity, or address. Existing values remain hidden; editing replaces only fields you enter. Delete and recreate an item to remove a field.
-2. Create an agent pass. Choose the item, allowed fields, CSS selectors, and an expiry from **5 minutes to 30 days**. No destination URL is required or stored on a key.
-3. Copy the generated prompt. It contains a unique `/agent/<random-id>` branch, a random 32-digit one-time PIN, scope, selectors, and expiry. The PIN is shown once.
-4. The agent opens that branch and enters the PIN and the page URL for its task, or sends the JSON request below. Only public HTTPS pages and the local demo are supported. Login items remain restricted to their saved website origin.
-5. A fresh, separate browser window fills the selected fields. The agent receives only status and a field count. **You** review and submit manually. Windows close after 15 minutes or when the server stops.
-
-Keys remain usable after logout and server restarts, until used, revoked, or expired. Logging out is not a substitute for revoking a key. Updating or deleting an item revokes its unused keys. A failed browser fill still consumes the PIN; missing or disallowed page URLs may be corrected without consuming it.
-
-For a first test, add the sample identity, create a key, open its agent page, and choose **Use the local demo form**. That form never sends entered values to a server.
+1. Add a login, identity, or address. Existing values remain hidden; editing replaces only fields you enter.
+2. Choose **Create agent pass**, select the fields, and set an expiry from **5 minutes to 30 days**. No PIN, CSS selectors, or destination URL entry is needed. The recipient is explicitly the **agentautofill receiving form on this device**.
+3. Copy the prompt shown once. It includes a dedicated `/submit/<random-id>` form, its submission endpoint, and a ciphertext package. It never includes plaintext values or a decryption key.
+4. The agent pastes the package unchanged into the receiving form and submits it, or sends the JSON request below.
+5. The server checks authorization, expiry, revocation, and package integrity, reserves the one-time package durably, then decrypts it. It stores the submitted fields in the owner's encrypted account database and returns only a receipt ID and field count. Activity records the receipt without field values. The last 100 submissions are retained; there is no read API for their contents.
 
 ```http
-POST /api/agent/<branch-id>/execute
+POST /api/forms/<package-id>/submit
 Content-Type: application/json
 
-{"pin":"<one-time PIN>","target":"https://example.com/form"}
+{"payload":"<exact encrypted package>"}
 ```
 
-A successful response contains `status: "filled"`, `fieldsFilled`, and a fixed explanatory message. It never contains autofill values. Invalid PINs return `401`; missing or disallowed URLs return `400`; unavailable or consumed keys return `410`; browser failures return `422` and consume the key.
+A successful response contains `status: "accepted"`, `receiptId`, `fieldsReceived`, and a fixed message. Wrong ciphertext returns `400`; expired, revoked, or consumed packages return `410`. A processing failure consumes the package and returns a generic `422`. If a connection fails after submitting, check Activity before trying again: the server may already have accepted the submission.
+
+This repository is both sender and receiver. This flow accepts and stores a form submission locally; it does not log in to external sites, fill their fields, or perform a purchase. Ordinary websites cannot decrypt these packages. Another website needs its own receiving integration and private key; the app currently targets only its own receiving form.
+
+Packages survive logout and restarts. Editing/deleting their source item, explicit revocation, or a password reset invalidates unused packages. Anyone holding a package can perform its authorized submission once, so keep it private even though they cannot read its contents through the API. No plaintext values are placed into the agent's DOM, URLs, cookies, or local storage.
+
+### Encryption and receiving boundary
+
+Each package uses a fresh 256-bit AES-GCM key and 96-bit IV. The content key is wrapped with RSA-3072 OAEP using SHA-256 and the receiver's public key. The form ID is bound through GCM additional authenticated data and the OAEP label. A persisted SHA-256 digest pins the exact authorized ciphertext; possessing a public key alone does not authorize arbitrary submissions. Receiving requires the matching one-time record as well as valid ciphertext.
+
+The private recipient key is generated on first package creation and stored inside `accounts.enc`, encrypted by the installation storage key. It is never served to a browser or agent. Back up both storage files described below. The private key and original vault values are accessible to the local server: this is protection for the agent-facing transport, not protection from the receiver or someone with filesystem/process access. JavaScript cannot guarantee erasure of plaintext strings from memory. HTTPS is still required before any public deployment.
+
+### Existing PIN passes
+
+Previously generated `/agent/<id>` PIN passes keep their private-browser behavior, including saved website restrictions for logins. Their legacy `/api/passes` creation and `/api/agent/<id>/execute` APIs remain for compatibility. New passes generated in the UI use encrypted submission. The `/demo` plaintext form remains only for legacy browser testing.
 
 ## Storage and security boundary
 
@@ -71,7 +81,7 @@ Account data is encrypted using AES-256-GCM, with a fresh IV for every atomic wr
 
 Back up **both** files while the server is stopped:
 
-- `.data/accounts.enc` — encrypted account metadata, password verifiers, saved details, activity, key hashes, and key states.
+- `.data/accounts.enc` — encrypted account metadata, password verifiers, saved details, received submissions, recipient private key, activity, package/PIN hashes, and key states.
 - `.data/account-key` — the random installation encryption key, created with owner-only file permissions.
 
 Losing `account-key` makes the account database unreadable. Anyone with access to both files can decrypt it, so protect the device and the backup. The server refuses to generate a replacement key over an existing database. `.data/` is git-ignored.
@@ -81,7 +91,7 @@ The app enforces:
 - Account ownership on every owner API operation; no plaintext-value retrieval endpoint.
 - Random session identifiers stored as hashes on the server. Cookies are HttpOnly and SameSite=Strict, with a seven-day server-enforced expiry. Sessions are not persisted across server restarts. Cookie names include the port to isolate separate local installations.
 - Same-origin checks, JSON-only mutation requests, and session-bound CSRF tokens for authenticated writes. Signup/login rate limits and generic incorrect-credential responses.
-- Random 128-bit agent branch IDs and 32-digit PINs (about 106 bits of entropy). Only PIN hashes are persisted. Five incorrect attempts revoke a key.
+- Random 128-bit receiving form IDs and authenticated encrypted packages. Only the package digest is retained for redemption. Legacy PIN passes use 32-digit PINs and revoke after five incorrect attempts.
 - A reservation during destination validation, and persisted consumption before any browser work. Interrupted in-flight keys fail closed on restart instead of becoming replayable.
 - Public destination DNS validation and address pinning. Login origin checks and exact-page checks during filling.
 - Private contexts without downloads or service workers. Cross-origin requests, popups, WebSockets, and navigation away from the supplied URL are blocked. Raw browser errors are never returned to agents.
@@ -91,11 +101,11 @@ The app enforces:
 
 The local HTTP cookie does not use the `Secure` flag because the app serves loopback HTTP. Public deployment would require HTTPS, secure cookies, operational hardening, and a separately secured browser service; do not tunnel this owner app to the internet.
 
-The destination website receives the filled values and can read or transmit them. Share keys only with agents you trust to choose the intended destination. An identity or address key allows its holder to choose any supported public HTTPS page.
+For legacy browser passes, the destination website receives the filled values and can read or transmit them. Share keys only with agents you trust to choose the intended destination. An identity or address key allows its holder to choose any supported public HTTPS page.
 
 An agent with unrestricted shell, filesystem, debugger, desktop/screen, process-memory, owner-session, or private-browser access is outside the privacy boundary. Prompts cannot enforce secrecy against those tools. The service decrypts data in memory and cannot reliably erase JavaScript strings or browser memory.
 
-The private browser is a fresh session, not the owner's or agent's existing authenticated browser. Third-party authentication, redirects, embedded frames, CAPTCHAs, payment flows, and websites requiring cross-origin resources may not work. A changing page may cause a partial fill; failure consumes the key and closes its window. Submitting to a different URL is also blocked.
+The legacy private browser is a fresh session, not the owner's or agent's existing authenticated browser. Third-party authentication, redirects, embedded frames, CAPTCHAs, payment flows, and websites requiring cross-origin resources may not work. A changing page may cause a partial fill; failure consumes the key and closes its window. Submitting to a different URL is also blocked.
 
 A cloud agent cannot reach another computer's localhost. Use an authorized local request tool. The app remains a local prototype, not an independently audited password manager, and should not be your only credential backup.
 

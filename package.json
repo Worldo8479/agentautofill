@@ -3,12 +3,12 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Local account-based autofill with encrypted storage and single-use agent keys.",
+  "description": "Local account-based autofill with encrypted storage and single-use encrypted form submissions.",
   "scripts": {
     "start": "node server/index.js",
     "dev": "node --watch server/index.js",
     "test": "node --test test/*.test.js",
-    "check": "node --check server/index.js && node --check server/app.js && node --check server/vault.js && node --check server/accounts.js && node --check server/runner.js && node --check public/app.js && node --check public/agent.js",
+    "check": "node --check server/index.js && node --check server/app.js && node --check server/vault.js && node --check server/accounts.js && node --check server/runner.js && node --check server/envelope.js && node --check public/app.js && node --check public/agent.js && node --check public/submission.js",
     "browser:install": "playwright install chromium"
   },
   "engines": {

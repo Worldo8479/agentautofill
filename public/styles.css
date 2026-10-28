@@ -357,3 +357,7 @@ h1{font-size:26px}
 .owner .profile-button{flex:none;justify-content:center;min-width:44px;min-height:44px;padding:6px}
 .profile-button .account-owner{display:none}
 }
+
+.encrypted-field small{font-size:11px;color:#737373;text-align:right}
+#encrypted-payload{width:100%;resize:vertical;border:1px solid #ddd;border-radius:7px;padding:12px;font-family:monospace;font-size:12px;line-height:1.6;overflow-wrap:anywhere}
+#encrypted-form>.notice{margin-bottom:20px}
